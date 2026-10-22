@@ -1,0 +1,26 @@
+--- a/frigate/track/tracked_object.py
++++ b/frigate/track/tracked_object.py
+@@ -75,6 +75,8 @@
+         self.thumbnail_data: dict[str, Any] | None = None
+         self.last_updated: float = 0
+         self.last_published: float = 0
++        # PTZ scheduling must not share the MQTT/event publication clock.
++        self.last_autotracker_update: float = 0.0
+         self.frame = None
+         self.active = True
+         self.pending_loitering = False
+@@ -351,9 +353,12 @@
+             if self.obj_data["frame_time"] - self.previous["frame_time"] > 60:
+                 significant_change = True
+ 
+-            # update autotrack at most 3 objects per second
+-            if self.obj_data["frame_time"] - self.previous["frame_time"] >= (1 / 3):
++            # Event/path publications update self.previous independently.
++            # Use a dedicated clock and the incoming frame so frequent event
++            # updates cannot starve PTZ tracking (or disable its rate limit).
++            if obj_data["frame_time"] - self.last_autotracker_update >= (1 / 3):
+                 autotracker_update = True
++                self.last_autotracker_update = obj_data["frame_time"]
+ 
+             # update path
+             width = self.camera_config.detect.width

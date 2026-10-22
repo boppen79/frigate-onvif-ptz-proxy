@@ -1,0 +1,29 @@
+services:
+  onvif-proxy:
+    build: .
+    image: onvif-idle-proxy:local
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      CAMERAS: "Camera=0.0.0.0:${PROXY_PORT:-8238}->${CAMERA_HOST:?Set CAMERA_HOST}:${CAMERA_ONVIF_PORT:-80}"
+      PUBLIC_HOST: "${PROXY_HOST:?Set PROXY_HOST}"
+      MIN_MOVE_TIME: "0.30"
+      IDLE_AFTER: "0.25"
+      MAX_MOVE_TIME: "8.0"
+      POSITION_EPSILON: "0.0008"
+      RELATIVE_PAN_GAIN: "1.0"
+      RELATIVE_TILT_GAIN: "1.0"
+      RELATIVE_PAN_MAX: "1.0"
+      RELATIVE_TILT_MAX: "1.0"
+      PTZ_DIAGNOSTICS: "false"
+      LOG_LEVEL: INFO
+    healthcheck:
+      test: [CMD, curl, -fsS, "http://127.0.0.1:${PROXY_PORT:-8238}/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
