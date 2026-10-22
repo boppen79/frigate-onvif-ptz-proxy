@@ -1,13 +1,33 @@
 # ONVIF Idle Proxy for Frigate PTZ autotracking
 
-A small ONVIF HTTP proxy for PTZ cameras that keep reporting `MOVING` after
-movement has stopped. It estimates movement state from reported PTZ positions
-so Frigate can send the next tracking correction.
+An ONVIF HTTP workaround for PTZ cameras that **already support the relative
+movement Frigate needs, but have broken or missing movement-status reporting**.
+These cameras can execute tracking moves, yet Frigate may keep waiting because
+`GetStatus` still reports `MOVING` after the motor has stopped. The proxy
+estimates movement state from reported PTZ positions so tracking can continue.
 
 **Status:** experimental workaround, tested with a Hikvision **DS-2DE2A404IW-DE3**
 and Frigate **0.18.0-rc2**. Other models, firmware and Frigate versions need testing.
-It does not add missing field-of-view movement support or make every PTZ camera
-compatible with Frigate autotracking.
+
+## Is this workaround for my camera?
+
+Frigate requires ONVIF field-of-view-relative pan/tilt movement:
+`RelativePanTiltTranslationSpace` must include `TranslationSpaceFov`.
+Ordinary PTZ control or generic `RelativeMove` support alone is insufficient.
+See [Frigate's camera support requirements](https://docs.frigate.video/configuration/autotracking/#checking-onvif-camera-support).
+
+| Camera behavior | Does this proxy address it? |
+| --- | --- |
+| Required FOV-relative moves work, but `MoveStatus` stays `MOVING` after stopping | Yes: this is the main target |
+| Required moves and useful PTZ positions work, but `MoveStatus` is missing | The proxy can insert movement status; camera testing is still needed |
+| Camera lacks `RelativeMove` or the required `TranslationSpaceFov` | No: the proxy does not implement or advertise missing movement capabilities |
+| Frigate reports “FOV relative movement not supported” | This proxy does not remove that requirement |
+| Moves work, but tracking corrections stop despite an IDLE status | Investigate Frigate scheduling; see the separate optional patch below |
+
+In other words, this helps a camera that is nearly compatible because of its
+**status reporting**, not one that cannot perform the required movements.
+It does not translate relative moves into continuous/absolute movement or
+fabricate ONVIF capability responses.
 
 ## Tested camera and host
 
@@ -131,7 +151,11 @@ forwarding, movement scaling, timeouts, retries, SOAP parsing and address
 rewriting. Optional Frigate regression tests run inside the pinned Frigate
 image; see the patch README.
 
-See [snapshot validation](docs/validation.md) for the checks run before publication.
+The initial snapshot built successfully as both Docker images. Its fake-camera
+harness passed 41 assertions, diagnostics passed 3 tests, and the optional
+Frigate regression harness passed 5 tests. The example Compose configuration
+also parsed successfully. These checks cover software behavior, not untested
+camera compatibility.
 
 ## Settings and findings from real walking tests
 
