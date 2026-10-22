@@ -4,10 +4,30 @@ A small ONVIF HTTP proxy for PTZ cameras that keep reporting `MOVING` after
 movement has stopped. It estimates movement state from reported PTZ positions
 so Frigate can send the next tracking correction.
 
-**Status:** experimental workaround, tested with one Hikvision PTZ camera and
-Frigate **0.18.0-rc2**. Other models, firmware and Frigate versions need testing.
+**Status:** experimental workaround, tested with a Hikvision **DS-2DE2A404IW-DE3**
+and Frigate **0.18.0-rc2**. Other models, firmware and Frigate versions need testing.
 It does not add missing field-of-view movement support or make every PTZ camera
 compatible with Frigate autotracking.
+
+## Tested camera and host
+
+The following identifies the actual test setup, not a compatibility list:
+
+| Component | Tested setup |
+| --- | --- |
+| Camera | Hikvision **DS-2DE2A404IW-DE3** |
+| Firmware | **V5.6.18 build 210428** (reported by ONVIF) |
+| Frigate | **0.18.0-rc2**, with the optional scheduling patch for the latest walk test |
+| Host | Ubuntu, Intel Core i5-6500T, 16 GB RAM; eight cameras configured |
+| Object detector | USB Coral |
+| Video decoding | Intel VAAPI with the `i965` driver on this host |
+| PTZ detection frames | **1280 × 720 at 7 fps** |
+| Recording stream | **2560 × 1440**, retained when detection dimensions changed |
+| Tracking | Person tracking, zoom disabled, camera-specific movement calibration |
+
+The camera does not provide reliable native movement-status behavior for this
+setup; the proxy works around that limitation. This is not a general claim
+that all Hikvision cameras or firmware versions have the same defect.
 
 ## How it works
 
@@ -113,13 +133,96 @@ image; see the patch README.
 
 See [snapshot validation](docs/validation.md) for the checks run before publication.
 
-## Observed results and limits
+## Settings and findings from real walking tests
 
-On the test installation, tracking improved after calibration, lower detection
-resolution and the separate scheduling fix. A subsequent close walking pass
-kept the same tracking ID and continued corrections, but briefly reached the
-right image edge. These observations do not isolate each change or guarantee
-results on another camera. Physical motor speed remains a hard limit.
+Our best tested baseline so far uses the following proxy overrides. These
+values differ from the conservative defaults in `compose.yaml`; they are a
+starting point for experiments on this camera, not universal settings:
+
+```yaml
+# Merge into the existing onvif-proxy service's environment:
+MIN_MOVE_TIME: "0.15"
+IDLE_AFTER: "0.10"
+MAX_MOVE_TIME: "8.0"
+POSITION_EPSILON: "0.0008"
+RELATIVE_PAN_GAIN: "1.0"
+RELATIVE_TILT_GAIN: "1.0"
+RELATIVE_PAN_MAX: "0.85"
+RELATIVE_TILT_MAX: "0.50"
+```
+
+Detection settings used for that baseline (merge into the existing camera):
+
+```yaml
+detect:
+  width: 1280
+  height: 720
+  fps: 7
+```
+
+### Detection resolution and latency matter
+
+More pixels do not automatically produce better tracking. Processing large
+frames can increase work and delay corrections on a busy host. This setup
+originally used 2560 × 1440 detection frames; we reduced them to 1280 × 720
+while retaining 7 fps and the full-resolution recording stream. That reduces
+the detection frame pixel count by 75%. The USB Coral remained in use.
+
+Before the change, one walking-test window had frame-to-command age up to
+**1.94 s**. A later window after resizing reached **0.69 s**, but its median
+was not lower and the walks differed. This supports investigating processing
+latency; it does **not** establish a controlled speedup from resolution alone.
+The separate scheduling fix was still needed afterward.
+
+Changing Frigate's detection dimensions can resize frames from the existing
+input; it does not by itself reduce the camera's encoded stream resolution
+or guarantee less decoder work. If decoding is the bottleneck, consider a
+lower-resolution camera substream for detection while retaining the main
+stream for recording. Check that it has adequate image detail, field of view
+and timely frames. We have not validated that alternative on this setup.
+
+Similarly, increasing detection fps can add load and backlog. Confirm that
+frames are current and processing keeps up before raising fps. A fast Coral
+inference time alone does not measure decoding or the complete tracking loop.
+
+### More gain is not more motor speed
+
+A pan gain of 1.5 produced overshoot in earlier tests; 1.0 with camera-specific
+calibration was a better baseline. Frigate was already requesting maximum
+movement speed, so amplifying translation made corrections larger rather
+than making the motor faster. Raising the pan cap from 0.75 to 0.85 alone did
+not clearly resolve losing the person; callback scheduling also mattered.
+Do not keep increasing gain to compensate for stale frames or missing updates.
+
+Calibrate movement with the proxy in the control path. If gain or movement
+limits affect the calibration moves, review those settings and recalibrate as
+needed. Never copy the test installation's movement weights to another camera.
+
+### Fixing movement status is only one part of tracking
+
+We observed a case where the proxy correctly returned IDLE, yet Frigate
+stopped issuing tracking updates while the person continued moving. The
+[separate scheduling patch](frigate-patch/README.md) addresses a reproducible
+publication-clock defect in the tested release. An IDLE proxy cannot fix
+missing callbacks inside Frigate by itself.
+
+After calibration, resizing and the scheduling fix, a close walking pass kept
+the same tracking ID and continued receiving corrections. In a one-minute
+window there were 21 relative moves, median frame-to-enqueue age of **282 ms**,
+and median command HTTP response time of **17 ms**. Those metrics describe
+that window, not a guaranteed tracking rate or end-to-end latency. One camera
+HTTP response still took **670 ms**.
+
+At the closest point the person briefly reached the right image edge, and
+three pan corrections reached the 0.85 cap. There is still limited tracking
+margin. Close lateral movement requires a higher angular tracking speed;
+physical motor speed remains a limit. Occlusion behind a pillar or vegetation
+can also interrupt visibility even when the control loop works correctly.
+
+Test similar walks at the same distance, in both directions, changing one
+setting at a time. Record lost tracks, edge clipping, overshoot and timing
+rather than judging smoothness alone. The observations above do not isolate
+every change or guarantee results on another camera.
 
 When reporting an issue, include camera model/firmware, Frigate version,
 redacted settings, timestamps and sanitized timing logs. Do not upload camera
