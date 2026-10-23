@@ -1,0 +1,239 @@
+--- a/frigate/ptz/autotrack.py
++++ b/frigate/ptz/autotrack.py
+@@ -672,7 +672,7 @@
+ 
+     def _predict_movement_time(self, camera, pan, tilt):
+         combined_movement = abs(pan) + abs(tilt)
+-        input_data = np.array([self.intercept[camera], combined_movement])
++        input_data = np.array([1.0, combined_movement])
+ 
+         return np.dot(self.move_coefficients[camera], input_data)
+ 
+@@ -828,7 +828,9 @@
+                                 await self.onvif.get_camera_status(camera)
+ 
+                         if (
+-                            zoom > 0
++                            self.config.cameras[camera].onvif.autotracking.zooming
++                            == ZoomingModeEnum.absolute
++                            and zoom is not None
+                             and self.ptz_metrics[camera].zoom_level.value != zoom
+                         ):
+                             await self.onvif._zoom_absolute(camera, zoom, 1)
+@@ -888,6 +890,15 @@
+ 
+             return clipped, diff
+ 
++        absolute_zoom = (
++            self.config.cameras[camera].onvif.autotracking.zooming
++            == ZoomingModeEnum.absolute
++        )
++        # None means no absolute zoom request; zero is a valid wide-angle target.
++        if absolute_zoom and zoom == self.ptz_metrics[camera].zoom_level.value:
++            zoom = None
++        zoom_pending = zoom is not None if absolute_zoom else zoom != 0
++
+         if (
+             frame_time > self.ptz_metrics[camera].start_time.value
+             and frame_time > self.ptz_metrics[camera].stop_time.value
+@@ -895,10 +906,11 @@
+         ):
+             # we can split up any large moves caused by velocity estimated movements if necessary
+             # get an excess amount and assign it instead of 0 below
+-            while pan != 0 or tilt != 0 or zoom != 0:
++            while pan != 0 or tilt != 0 or zoom_pending:
+                 pan, _ = split_value(pan)
+                 tilt, _ = split_value(tilt)
+-                zoom, _ = split_value(zoom, False)
++                if zoom is not None:
++                    zoom, _ = split_value(zoom, False)
+ 
+                 logger.debug(
+                     f"{camera}: Enqueue movement for frame time: {frame_time} pan: {pan}, tilt: {tilt}, zoom: {zoom}"
+@@ -911,7 +923,8 @@
+                 # reset values to not split up large movements
+                 pan = 0
+                 tilt = 0
+-                zoom = 0
++                zoom = None if absolute_zoom else 0
++                zoom_pending = False
+ 
+     def _touching_frame_edges(self, camera, box):
+         camera_config = self.config.cameras[camera]
+@@ -938,6 +951,9 @@
+ 
+         # estimate_velocity is a numpy array of bbox top,left and bottom,right velocities
+         velocities = obj.obj_data["estimate_velocity"]
++        if np.shape(velocities) != (2, 2) or not np.all(np.isfinite(velocities)):
++            logger.debug(f"{camera}: Rejecting non-finite/malformed image velocity")
++            return False, np.zeros((4,))
+         logger.debug(
+             f"{camera}: Velocity (Norfair): {tuple(np.round(velocities).flatten().astype(int))}"
+         )
+@@ -1215,10 +1231,13 @@
+                 # this box could exceed the frame boundaries if velocity is high
+                 # but we'll handle that in _enqueue_move() as two separate moves
+                 current_box = np.array(obj.obj_data["box"])
+-                predicted_box = (
+-                    current_box
+-                    + camera_fps * predicted_movement_time * average_velocity
+-                )
++                # Account for internal frame age as well as motor travel. Keep
++                # the lead bounded when a noisy estimate or slow move occurs.
++                frame_age = max(0.0, min(0.5, time.time() - obj.obj_data["frame_time"]))
++                horizon = min(0.75, predicted_movement_time + frame_age)
++                displacement = camera_fps * horizon * average_velocity
++                limits = np.array([camera_width, camera_height] * 2) * 0.18
++                predicted_box = current_box + np.clip(displacement, -limits, limits)
+ 
+                 predicted_box = np.round(predicted_box).astype(int)
+ 
+@@ -1288,8 +1307,63 @@
+         if camera_config.onvif.autotracking.zooming != ZoomingModeEnum.disabled:
+             zoom = self._get_zoom_amount(camera, obj, obj.obj_data["box"], 0)
+ 
+-            if zoom != 0:
++            if zoom is not None and (
++                camera_config.onvif.autotracking.zooming == ZoomingModeEnum.absolute
++                or zoom != 0
++            ):
+                 self._enqueue_move(camera, obj.obj_data["frame_time"], 0, 0, zoom)
++
++    def _absolute_zoom_guard(self, camera, obj):
++        """Estimate approach only from observations at the same zoom level."""
++        if not hasattr(self, "_absolute_zoom_observations"):
++            self._absolute_zoom_observations = {}
++        data = obj.obj_data
++        frame = data["frame_time"]
++        zoom = self.ptz_metrics[camera].zoom_level.value
++        height = (data["box"][3] - data["box"][1]) / self.config.cameras[camera].frame_shape[0]
++        if not np.isfinite(height) or height <= 0:
++            return False, False, False
++        identity = data.get("id")
++        state = self._absolute_zoom_observations.get(camera)
++        if state is None or state["id"] != identity or frame < state["last_frame"]:
++            state = {"id": identity, "zoom": zoom, "samples": [],
++                     "last_frame": frame - 1, "approaching": False,
++                     "settle_until": 0.0}
++            self._absolute_zoom_observations[camera] = state
++        if abs(zoom - state["zoom"]) > 0.01:
++            state["samples"] = []
++            state["zoom"] = zoom
++            state["settle_until"] = frame + 1.5
++        if frame > state["last_frame"] and frame >= state["settle_until"]:
++            state["samples"].append((frame, height))
++            state["last_frame"] = frame
++        state["samples"] = [(t, h) for t, h in state["samples"] if frame - t <= 2.5][-12:]
++        samples = state["samples"]
++        ready = len(samples) >= 2 and samples[-1][0] - samples[0][0] >= 0.45
++        if ready:
++            # Fit growth across the whole stable-zoom window; overlapping
++            # two-point medians suppressed real growth in short windows.
++            times = np.array([t - samples[0][0] for t, _ in samples])
++            heights = np.log(np.array([h for _, h in samples]))
++            growth_rate = np.polyfit(times, heights, 1)[0]
++            growth = np.expm1(growth_rate * times[-1])
++            # A short bbox-size wobble after zoom must not latch approach.
++            if (len(samples) >= 3 and times[-1] >= 1.0
++                    and growth >= 0.12 and growth_rate >= 0.05):
++                state["approaching"] = True
++            elif (len(samples) >= 3 and times[-1] >= 1.0
++                  and growth <= -0.12 and growth_rate <= -0.05
++                  and samples[-1][1] < samples[-2][1] * 0.98
++                  and self._touching_frame_edges(camera, data["box"]) == 0):
++                # Do not expire approach protection merely because growth
++                # pauses; require new evidence of receding at stable zoom.
++                state["approaching"] = False
++        approaching = state["approaching"]
++        near = height >= 0.30 or (approaching and height >= 0.15)
++        edge_risk = self._touching_frame_edges(camera, data["box"]) > 0 and height >= 0.15
++        wide = zoom > self.ptz_metrics[camera].min_zoom.value and (near or edge_risk)
++        logger.debug(f"{camera}: Zoom guard: ready={ready} approaching={approaching} height={height:.3f} wide={wide}")
++        return ready, approaching, wide
+ 
+     def _get_zoom_amount(
+         self,
+@@ -1305,7 +1379,11 @@
+         camera_width = camera_config.frame_shape[1]
+         camera_height = camera_config.frame_shape[0]
+ 
+-        zoom = 0
++        zoom = (
++            None
++            if camera_config.onvif.autotracking.zooming == ZoomingModeEnum.absolute
++            else 0
++        )
+         result = None
+         current_zoom_level = self.ptz_metrics[camera].zoom_level.value
+         target_box = max(
+@@ -1315,6 +1393,10 @@
+ 
+         # absolute zooming separately from pan/tilt
+         if camera_config.onvif.autotracking.zooming == ZoomingModeEnum.absolute:
++            ready, approaching, wide = self._absolute_zoom_guard(camera, obj)
++            if wide:
++                logger.debug(f"{camera}: Zoom guard requesting full wide angle")
++                return 0.0
+             # don't zoom on initial move
+             if "target_box" not in self.tracked_object_metrics[camera]:
+                 zoom = current_zoom_level
+@@ -1333,10 +1415,17 @@
+                         self.ptz_metrics[camera].max_zoom.value
+                         - self.ptz_metrics[camera].min_zoom.value
+                     ) / 20
+-                    if result:
+-                        zoom = min(1.0, current_zoom_level + level)
+-                    else:
+-                        zoom = max(0.0, current_zoom_level - 2 * level)
++                    if result and (approaching or not ready):
++                        result = None
++                    elif result:
++                        height = (obj.obj_data["box"][3] - obj.obj_data["box"][1]) / camera_height
++                        # Larger corrections for a tiny distant target; taper
++                        # near the subject instead of changing motor speed.
++                        step = level * (4 if height < 0.10 else 3 if height < 0.18 else 1)
++                        zoom = min(1.0, current_zoom_level + step)
++                    elif result is False:
++                        height = (obj.obj_data["box"][3] - obj.obj_data["box"][1]) / camera_height
++                        zoom = 0.0 if height >= 0.20 else max(0.0, current_zoom_level - 2 * level)
+ 
+         # relative zooming concurrently with pan/tilt
+         if camera_config.onvif.autotracking.zooming == ZoomingModeEnum.relative:
+--- a/frigate/track/norfair_tracker.py
++++ b/frigate/track/norfair_tracker.py
+@@ -110,6 +110,26 @@
+         if distance < 0.5:
+             return distance
+     return 1
++
++
++def image_velocity(tracked_object: TrackedObject) -> np.ndarray:
++    """Express compensated Kalman velocity in the current image's pixels/frame.
++
++    Transform two positions, not a vector as though it were a position: this
++    cancels translation and handles zoom/perspective at each bbox corner.
++    Invalid transforms stay invalid so the PTZ validity filter can reject them.
++    """
++    velocity = np.asarray(tracked_object.estimate_velocity, dtype=float)
++    if tracked_object.abs_to_rel is None:
++        return velocity.copy()
++    try:
++        position = tracked_object.get_estimate(absolute=True)
++        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
++            result = (tracked_object.abs_to_rel(position + velocity)
++                      - tracked_object.abs_to_rel(position))
++        return np.asarray(result, dtype=float)
++    except (ValueError, TypeError, np.linalg.LinAlgError):
++        return np.full(velocity.shape, np.nan)
+ 
+ 
+ class NorfairTracker(ObjectTracker):
+@@ -613,7 +633,7 @@
+             new_obj = {
+                 **t.last_detection.data,
+                 "estimate": estimate,
+-                "estimate_velocity": t.estimate_velocity,
++                "estimate_velocity": image_velocity(t),
+             }
+             active_ids.append(str(t.global_id))
+             if str(t.global_id) not in self.track_id_map:

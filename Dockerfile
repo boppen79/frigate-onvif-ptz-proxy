@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="ONVIF Idle Proxy"
 LABEL org.opencontainers.image.description="Fixes stuck MoveStatus on Hikvision/Dahua PTZ cameras for Frigate autotracking"
-LABEL org.opencontainers.image.version="1.4.0"
+LABEL org.opencontainers.image.version="1.5.0"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1

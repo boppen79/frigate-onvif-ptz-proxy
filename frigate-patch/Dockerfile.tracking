@@ -1,0 +1,5 @@
+FROM ghcr.io/blakeblackshear/frigate:0.18.0-rc2@sha256:9678a83a76e4730ac7d9ea7428370e32ae656d6b312aaad30d6c69f3fef14d35
+COPY apply_patch.py apply_tracking.py tracking.patch tracking-manifest.json /tmp/frigate-patches/
+RUN python3 /tmp/frigate-patches/apply_patch.py \
+ && python3 /tmp/frigate-patches/apply_tracking.py \
+ && rm -r /tmp/frigate-patches

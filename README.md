@@ -37,13 +37,13 @@ The following identifies the actual test setup, not a compatibility list:
 | --- | --- |
 | Camera | Hikvision **DS-2DE2A404IW-DE3** |
 | Firmware | **V5.6.18 build 210428** (reported by ONVIF) |
-| Frigate | **0.18.0-rc2**, with the optional scheduling patch for the latest walk test |
+| Frigate | **0.18.0-rc2**, with the optional tracking bundle for the latest observation |
 | Host | Ubuntu, Intel Core i5-6500T, 16 GB RAM; eight cameras configured |
 | Object detector | USB Coral |
 | Video decoding | Intel VAAPI with the `i965` driver on this host |
 | PTZ detection frames | **1280 × 720 at 7 fps** |
 | Recording stream | **2560 × 1440**, retained when detection dimensions changed |
-| Tracking | Person tracking, zoom disabled, camera-specific movement calibration |
+| Tracking | Person tracking, absolute zoom with the optional tracking bundle; camera-specific movement calibration |
 
 The camera does not provide reliable native movement-status behavior for this
 setup; the proxy works around that limitation. This is not a general claim
@@ -65,12 +65,13 @@ relative pan/tilt corrections; gains change distance, not motor speed.
 Movement commands are sent once: retries could execute a move twice.
 Read requests can be retried.
 
-There are **two independent fixes** in this repository:
+There are **two separate components** in this repository:
 
 * The proxy handles incorrect or missing camera movement status.
-* An optional [Frigate scheduling patch](frigate-patch/README.md) fixes periodic
-  autotracker updates being starved by frequent object event publications in
-  the tested release. It is not required to run the proxy.
+* Optional [Frigate patches](frigate-patch/README.md) provide a scheduling-only
+  fix or the complete tested tracking bundle: scheduling, movement prediction,
+  wide-angle zoom recovery and approach protection. Neither is required to run
+  the proxy. The bundle is experimental and pinned to the tested image.
 
 ## Requirements
 
@@ -142,7 +143,8 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
 python test_proxy.py
-python -m unittest -v test_diagnostics.py
+python -m unittest -v test_diagnostics test_startup_guard test_proxy_target test_quantum
+python test_target_http.py
 ```
 
 The integration harness starts a fake camera and proxy on local test ports;
@@ -151,15 +153,16 @@ forwarding, movement scaling, timeouts, retries, SOAP parsing and address
 rewriting. Optional Frigate regression tests run inside the pinned Frigate
 image; see the patch README.
 
-The initial snapshot built successfully as both Docker images. Its fake-camera
-harness passed 41 assertions, diagnostics passed 3 tests, and the optional
-Frigate regression harness passed 5 tests. The example Compose configuration
-also parsed successfully. These checks cover software behavior, not untested
-camera compatibility.
+Validation for 1.5 passed 41 fake-camera assertions, 30 proxy unit tests,
+the target-completion HTTP test and 37 optional Frigate/build tests. They cover
+startup grace, target-confirmed zoom completion, feedback quantization and the
+optional Frigate fixes. See [the patch README](frigate-patch/README.md) for the
+reproducible build and test commands. These checks cover software behavior,
+not untested camera compatibility.
 
 ## Settings and findings from real walking tests
 
-Our best tested baseline so far uses the following proxy overrides. These
+The earlier zoom-disabled baseline used the following proxy overrides. These
 values differ from the conservative defaults in `compose.yaml`; they are a
 starting point for experiments on this camera, not universal settings:
 
@@ -251,6 +254,54 @@ every change or guarantee results on another camera.
 When reporting an issue, include camera model/firmware, Frigate version,
 redacted settings, timestamps and sanitized timing logs. Do not upload camera
 passwords, full private configurations or recordings of people.
+
+## Latest tracking bundle and field observations (23 October 2026)
+
+The complete optional bundle includes fixes developed after the earlier
+zoom-disabled baseline. See [build, configuration and rollback](frigate-patch/README.md).
+Proxy 1.5 also adds opt-in startup grace and target-confirmed absolute zoom
+completion; [configuration details](docs/configuration.md#delayed-movement-and-absolute-zoom-proxy-15)
+explain the camera-specific feedback mapping. Default quick-start behavior
+remains conservative and zoom-disabled.
+
+What we learned:
+
+* A zero absolute zoom target means full wide angle. Treating it as “no zoom
+  request” can prevent recovery when a person returns toward the camera.
+* Norfair's Kalman velocity is in its accumulated absolute reference. PTZ needs
+  current-image pixels/frame. Map position and position-plus-velocity through
+  the current transform and subtract them; do not transform a vector as a point.
+* Unreliable velocity must still be rejected. Bounded prediction can provide
+  lead when estimates are valid; it does not establish the motor's speed limit.
+* Small bbox changes immediately after lens movement can falsely suggest
+  approach. The bundle waits 1.5 seconds after observed zoom changes and
+  requires sustained size growth before latching approach protection.
+* Approach protection must survive brief plateaus and zoom changes. It releases
+  on confirmed recession or a new object ID, **not merely on standing still**.
+* Reported zoom feedback can be quantized. Completing a known zoom target can
+  avoid waiting through a long generic idle timer, but the mapping is model-specific.
+
+In a read-only review of a natural movement sequence starting at 15:59:30,
+the person remained visible through most of the route, from the veranda to
+the far lawn. Near 15:59:34–49 the camera still made large corrections and
+briefly clipped the lower body. Farther away it progressively zoomed in while
+the person continued walking, reaching reported zoom 1.0 around 16:01:13.
+Vegetation then obscured the person. This is evidence that distant detail zoom
+works without requiring a stop, not proof of identification quality.
+
+Twenty of 39 logged PTZ decisions used nonzero accepted velocity; the remaining
+19 used zero. Prediction is now exercised, but invalid estimates and close-pass
+framing remain limitations. The route differs from earlier tests, so this is
+not a controlled before/after improvement measurement. A persistent object ID
+also does not prove uninterrupted detection: stale-track retention can span
+periods when the person is not detected. Position samples and HTTP timings do
+not independently measure motor motion or sensor-to-control latency.
+
+Separately, nighttime IR reflection from a nearby roof made the garden dark
+when the camera tilted upward. A BLC exposure region over the garden is a
+candidate camera-side mitigation; it has not been validated by these daylight
+walks. Camera placement or separate IR illumination can address the reflection
+source. Frigate/proxy timing changes do not fix exposure or occlusion.
 
 ## License and attribution
 

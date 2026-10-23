@@ -1,0 +1,10 @@
+{
+  "frigate/ptz/autotrack.py": {
+    "before": "4d68739ff44c7c2fa3c6828aaf5407136427f6a2687584a15ee401daba130d3e",
+    "after": "5aa5f43582dce0c6ce202eeccc42d31185fde26e7588642e18cd001dd1b60082"
+  },
+  "frigate/track/norfair_tracker.py": {
+    "before": "1ce3fdfa45d18dea00765a6e4d2d7703f4ee983ba63c45424213e19283af038b",
+    "after": "fcc8dbe170b0a975c0ed2716dfa9ec54aa49cb365d9183356ecf39c03bf0d0e6"
+  }
+}

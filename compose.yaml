@@ -15,6 +15,12 @@ services:
       RELATIVE_TILT_GAIN: "1.0"
       RELATIVE_PAN_MAX: "1.0"
       RELATIVE_TILT_MAX: "1.0"
+      # Opt-in timing/zoom features; see docs/configuration.md before enabling.
+      STARTUP_GRACE: "0.0"
+      ABSOLUTE_STARTUP_GRACE: "0.0"
+      ABSOLUTE_IDLE_AFTER: "0.0"
+      ZOOM_TARGET_TOLERANCE: "0.0"
+      ZOOM_TARGET_QUANTUM: "0.0"
       PTZ_DIAGNOSTICS: "false"
       LOG_LEVEL: INFO
     healthcheck:

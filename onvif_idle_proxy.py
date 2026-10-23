@@ -42,7 +42,7 @@ Konfigureras helt via miljovariabeln CAMERAS, t.ex.:
 
 Flera kameror separeras med kommatecken:
 
-    CAMERAS=Camera=0.0.0.0:8238->192.0.2.20:80,Dome=0.0.0.0:8230->192.0.2.21:80
+    CAMERAS=Camera=0.0.0.0:8238->192.0.2.20:80,Camera2=0.0.0.0:8230->192.0.2.21:80
 
 Licens: MIT. Ingen garanti - detta ar en workaround for en firmwarebugg.
 """
@@ -62,7 +62,7 @@ import aiohttp
 from aiohttp import web
 from lxml import etree
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 PTZ_DIAGNOSTICS = os.getenv("PTZ_DIAGNOSTICS", "false").lower() == "true"
 
 
@@ -92,6 +92,40 @@ def translation_values(body: bytes) -> dict:
         pass
     return {}
 
+def reported_zoom_target(target: float) -> float:
+    """Optional camera-specific floor quantization, established from motor tests."""
+    import math
+    if ZOOM_TARGET_QUANTUM <= 0 or target in (0.0, 1.0):
+        return target
+    return max(0.0, min(1.0, math.floor(target / ZOOM_TARGET_QUANTUM + 1e-9) * ZOOM_TARGET_QUANTUM))
+
+
+def absolute_zoom_target(body: bytes) -> float | None:
+    """Recognize only zoom-only AbsoluteMove in normalized position space."""
+    import math
+    try:
+        root = etree.fromstring(body, etree.XMLParser(resolve_entities=False, no_network=True))
+        ns = root.tag.split("}")[0].lstrip("{")
+        if ns not in ("http://www.w3.org/2003/05/soap-envelope", "http://schemas.xmlsoap.org/soap/envelope/"):
+            return None
+        soap_body = root.find("{" + ns + "}Body")
+        if soap_body is None or len(soap_body) != 1 or _local(soap_body[0].tag) != "AbsoluteMove":
+            return None
+        positions = [x for x in soap_body[0] if _local(x.tag) == "Position"]
+        if len(positions) != 1 or len(positions[0]) != 1:
+            return None
+        zoom = positions[0][0]
+        if _local(zoom.tag) != "Zoom":
+            return None
+        space = zoom.get("space")
+        if space and space != "http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace":
+            return None
+        target = float(zoom.get("x", "nan"))
+        return target if math.isfinite(target) and 0 <= target <= 1 else None
+    except (ValueError, TypeError, AttributeError, etree.XMLSyntaxError):
+        return None
+
+
 # --------------------------------------------------------------------------
 # Installningar (alla overstyrbara via miljovariabler)
 # --------------------------------------------------------------------------
@@ -103,6 +137,18 @@ MIN_MOVE_TIME = float(os.getenv("MIN_MOVE_TIME", "0.30"))
 
 #: Hur lange koordinaterna maste vara oforandrade innan IDLE rapporteras.
 IDLE_AFTER = float(os.getenv("IDLE_AFTER", "0.25"))
+
+# Optional bounded wait for the first observed movement; 0 preserves defaults.
+STARTUP_GRACE = float(os.getenv("STARTUP_GRACE", "0.0"))
+ABSOLUTE_STARTUP_GRACE = float(os.getenv("ABSOLUTE_STARTUP_GRACE", "0.0"))
+ABSOLUTE_IDLE_AFTER = float(os.getenv("ABSOLUTE_IDLE_AFTER", "0.0"))
+# Opt-in; half-step tolerance for this camera's ~1/30 normalized zoom feedback.
+ZOOM_TARGET_TOLERANCE = float(os.getenv("ZOOM_TARGET_TOLERANCE", "0.0"))
+ZOOM_TARGET_QUANTUM = float(os.getenv("ZOOM_TARGET_QUANTUM", "0.0"))
+if not 0 <= ZOOM_TARGET_QUANTUM <= 1:
+    raise ValueError("ZOOM_TARGET_QUANTUM must be between0 and1")
+if STARTUP_GRACE < 0 or ABSOLUTE_STARTUP_GRACE < 0:
+    raise ValueError("STARTUP_GRACE must be >= 0")
 
 #: Sakerhetsventil. Rapportera aldrig MOVING langre an detta.
 MAX_MOVE_TIME = float(os.getenv("MAX_MOVE_TIME", "8.0"))
@@ -176,6 +222,10 @@ class PTZState:
     pending_reason: str = ""
     command_id: int = 0
     first_change_seen: bool = False
+    last_idle_at: float = 0.0
+    zoom_target: float | None = None
+    zoom_target_since: float | None = None
+    zoom_target_samples: int = 0
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def note_move(self, action: str, detail: str = "") -> None:
@@ -186,6 +236,10 @@ class PTZState:
         self.move_commands_since_log += 1
         self.command_id += 1
         self.first_change_seen = False
+        self.last_idle_at = 0.0
+        self.zoom_target = None
+        self.zoom_target_since = None
+        self.zoom_target_samples = 0
         log.debug("[%s] rorelsekommando registrerat: %s", self.name, action)
 
     def note_stop(self) -> None:
@@ -258,8 +312,10 @@ class PTZState:
 
         return moving
 
-    def update_position(self, pos: tuple[float, float, float] | None) -> None:
+    def update_position(self, pos: tuple[float, float, float] | None, zoom_observed: bool = True) -> None:
         if pos is None:
+            self.zoom_target_since = None
+            self.zoom_target_samples = 0
             return
         now = time.monotonic()
         if self.last_position is None:
@@ -270,7 +326,16 @@ class PTZState:
             abs(a - b) > POSITION_EPSILON
             for a, b in zip(pos, self.last_position)
         )
+        if PTZ_DIAGNOSTICS and (self.last_move_cmd or (
+                self.last_idle_at and now - self.last_idle_at < 1.0)):
+            diagnostic(self.name, "position_sample", command_id=self.command_id,
+                       pan=pos[0], tilt=pos[1], zoom=pos[2], changed=moved,
+                       active=bool(self.last_move_cmd))
         if moved:
+            if (not self.last_move_cmd and self.last_idle_at
+                    and now - self.last_idle_at < 1.0):
+                diagnostic(self.name, "late_position_change", command_id=self.command_id,
+                           since_idle_ms=round((now - self.last_idle_at) * 1000, 2))
             if self.last_move_cmd and not self.first_change_seen:
                 diagnostic(self.name, "first_position_change",
                            command_id=self.command_id,
@@ -278,6 +343,14 @@ class PTZState:
                 self.first_change_seen = True
             self.last_change = now
             self.last_position = pos
+        if self.zoom_target is not None and ZOOM_TARGET_TOLERANCE > 0:
+            if zoom_observed and abs(pos[2] - self.zoom_target) <= ZOOM_TARGET_TOLERANCE:
+                if self.zoom_target_since is None:
+                    self.zoom_target_since = now
+                self.zoom_target_samples += 1
+            else:
+                self.zoom_target_since = None
+                self.zoom_target_samples = 0
 
     def is_moving(self) -> bool:
         """Avgor om kameran ror sig - utan att lita pa firmware."""
@@ -313,12 +386,39 @@ class PTZState:
                 f"{self.last_action} mottaget; minimitid {MIN_MOVE_TIME:.2f}s",
             )
 
+        # A known zoom-only target can complete before the conservative idle timer.
+        # Require observed movement and repeated target samples spanning 150ms.
+        if (self.zoom_target is not None and self.first_change_seen
+                and self.zoom_target_since is not None and self.zoom_target_samples >= 2
+                and now - self.zoom_target_since >= 0.15):
+            diagnostic(self.name, "zoom_target_reached", command_id=self.command_id,
+                       target=self.zoom_target, elapsed_ms=round(elapsed * 1000, 2))
+            diagnostic(self.name, "idle", command_id=self.command_id,
+                       elapsed_ms=round(elapsed * 1000, 2), position_change_seen=True,
+                       reason="zoom_target_reached")
+            self.last_idle_at = now
+            self.last_move_cmd = 0.0
+            return self._report_decision(False, "zoommal bekraftat i flera statusprov")
+
+        # An unchanged position before the motor starts is not evidence that
+        # a requested move has completed. Keep this wait bounded for no-op moves.
+        startup_grace = max(STARTUP_GRACE, ABSOLUTE_STARTUP_GRACE
+                            if self.last_action.startswith("AbsoluteMove") else 0.0)
+        if not self.first_change_seen and elapsed < startup_grace:
+            return self._report_decision(
+                True, f"vantar pa forsta positionsandring; startfrist {startup_grace:.2f}s"
+            )
+
         # Koordinaterna har statt still tillrackligt lange -> IDLE.
         unchanged_for = now - self.last_change
-        if unchanged_for > IDLE_AFTER:
+        idle_after = max(IDLE_AFTER, ABSOLUTE_IDLE_AFTER
+                         if self.last_action.startswith("AbsoluteMove") else 0.0)
+        if unchanged_for > idle_after:
             diagnostic(self.name, "idle", command_id=self.command_id,
                        elapsed_ms=round(elapsed * 1000, 2),
-                       position_change_seen=self.first_change_seen)
+                       position_change_seen=self.first_change_seen,
+                       unchanged_ms=round(unchanged_for * 1000, 2))
+            self.last_idle_at = now
             self.last_move_cmd = 0.0
             return self._report_decision(
                 False, f"positionen oforandrad i {unchanged_for:.2f}s"
@@ -385,7 +485,13 @@ def rewrite_move_status(body: bytes, state: PTZState) -> bytes:
 
     changed = False
     for ptz_status in ptz_status_nodes:
-        state.update_position(extract_position(ptz_status))
+        zoom_nodes = ptz_status.xpath("./*[local-name()='Position']/*[local-name()='Zoom']")
+        import math
+        try:
+            zoom_observed = len(zoom_nodes) == 1 and math.isfinite(float(zoom_nodes[0].get("x", "nan")))
+        except (ValueError, TypeError):
+            zoom_observed = False
+        state.update_position(extract_position(ptz_status), zoom_observed=zoom_observed)
         desired = "MOVING" if state.is_moving() else "IDLE"
 
         move_status = None
@@ -583,6 +689,11 @@ class CameraProxy:
         if action == "RelativeMove":
             body, move_detail = amplify_relative_move(body)
         self._note_action(action, move_detail)
+        if action == "AbsoluteMove" and ZOOM_TARGET_TOLERANCE > 0:
+            zoom_target_value = absolute_zoom_target(body)
+            if zoom_target_value is not None:
+                self.state.zoom_target = reported_zoom_target(zoom_target_value)
+                requested = {"zoom": zoom_target_value, "reported_zoom_target": self.state.zoom_target}
         command_id = self.state.command_id
         if action in MOVE_ACTIONS or action in STOP_ACTIONS:
             diagnostic(self.name, "command", command_id=command_id, action=action,

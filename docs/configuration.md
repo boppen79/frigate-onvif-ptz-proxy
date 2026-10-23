@@ -38,3 +38,54 @@ latency. A fast HTTP response does not prove the video stream is current.
 To stop using the workaround, restore Frigate's ONVIF host/port to the camera,
 then stop this Compose stack. The example stack has no recording/database
 volumes and does not change camera stream settings.
+
+## Delayed movement and absolute zoom (proxy 1.5)
+
+These features are opt-in. Defaults preserve the earlier movement estimator.
+They are independent of the optional Frigate tracking bundle.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `STARTUP_GRACE` | `0.0` | Bounded seconds to wait for the first observed position change |
+| `ABSOLUTE_STARTUP_GRACE` | `0.0` | Additional minimum startup window for `AbsoluteMove` |
+| `ABSOLUTE_IDLE_AFTER` | `0.0` | Additional minimum unchanged-position interval for `AbsoluteMove` |
+| `ZOOM_TARGET_TOLERANCE` | `0.0` | Opt in to completion based on reported zoom reaching a known target |
+| `ZOOM_TARGET_QUANTUM` | `0.0` | Optional floor quantization of the expected zoom feedback; 0 disables it |
+
+Startup grace stops an initially unchanged position from immediately being
+interpreted as a completed move. Once movement is observed, normal idle
+handling resumes. The maximum move timeout and Stop override the grace.
+It does not solve every pause or late motor movement.
+
+Target completion recognizes only **zoom-only AbsoluteMove** requests in the
+normalized generic position space. It requires observed movement, at least two
+valid zoom observations within tolerance and 150 ms of target confirmation.
+Missing zoom feedback breaks confirmation. Mixed pan/tilt/zoom commands and
+unknown zoom spaces retain the conservative idle path. No-op targets use the
+bounded fallback rather than pretending that movement was observed.
+
+The tested camera reports zoom in approximately 1/30 normalized increments,
+rounding requests down. `ZOOM_TARGET_QUANTUM` changes only the expected feedback;
+it does **not** rewrite the requested lens position. Do not enable this mapping
+for another camera without measuring its behavior. Too broad a tolerance can
+report completion early; a wrong quantum may prevent early completion.
+
+The camera-specific experiment used this additional environment fragment:
+
+```yaml
+STARTUP_GRACE: "0.35"
+ABSOLUTE_STARTUP_GRACE: "1.2"
+ABSOLUTE_IDLE_AFTER: "1.0"
+ZOOM_TARGET_TOLERANCE: "0.001"
+ZOOM_TARGET_QUANTUM: "0.03333333333333333"
+```
+
+Merge these into the proxy service only after verifying the camera's feedback.
+Use your existing Frigate service for the separate tracking image; see
+[the optional patch instructions](../frigate-patch/README.md).
+
+With diagnostics enabled, `position_sample`, `late_position_change` and
+`zoom_target_reached` help distinguish delayed start, pauses and target
+completion. Samples remain camera-reported positions. Absence of a
+`late_position_change` event does not prove the motor stopped: it requires
+subsequent status polling to observe it. Diagnostic logs can grow quickly.
